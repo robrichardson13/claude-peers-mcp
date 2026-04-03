@@ -98,6 +98,17 @@ function log(msg: string) {
   console.error(`[claude-peers] ${msg}`);
 }
 
+function getLivePpid(): number | null {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
+    const text = new TextDecoder().decode(proc.stdout).trim();
+    const ppid = parseInt(text, 10);
+    return Number.isNaN(ppid) ? null : ppid;
+  } catch {
+    return null;
+  }
+}
+
 async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
@@ -488,8 +499,10 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
+  const originalPpid = process.ppid;
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
+    ppid: originalPpid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
@@ -519,8 +532,16 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat (with orphan detection)
   const heartbeatTimer = setInterval(async () => {
+    // Check if parent process died (reparented to init/launchd)
+    const currentPpid = getLivePpid();
+    if (currentPpid !== null && currentPpid !== originalPpid) {
+      log(`Parent process died (ppid changed from ${originalPpid} to ${currentPpid}), exiting`);
+      await cleanup();
+      return;
+    }
+
     if (myId) {
       try {
         await brokerFetch("/heartbeat", { id: myId });
