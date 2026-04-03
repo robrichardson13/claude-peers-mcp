@@ -58,15 +58,32 @@ db.run(`
   )
 `);
 
+// Migration: add ppid column for orphan detection
+try {
+  db.run("ALTER TABLE peers ADD COLUMN ppid INTEGER NOT NULL DEFAULT 0");
+} catch {
+  // Column already exists
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, ppid FROM peers").all() as { id: string; pid: number; ppid: number }[];
   for (const peer of peers) {
+    let shouldRemove = false;
     try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
       process.kill(peer.pid, 0);
     } catch {
-      // Process doesn't exist, remove it
+      shouldRemove = true;
+    }
+    // Check if parent is dead (orphaned MCP server)
+    if (!shouldRemove && peer.ppid > 0) {
+      try {
+        process.kill(peer.ppid, 0);
+      } catch {
+        shouldRemove = true;
+      }
+    }
+    if (shouldRemove) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -81,8 +98,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, ppid, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -145,7 +162,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.ppid ?? 0, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
 
@@ -184,16 +201,23 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer's process is still alive and not orphaned
   return peers.filter((p) => {
     try {
       process.kill(p.pid, 0);
-      return true;
     } catch {
-      // Clean up dead peer
       deletePeer.run(p.id);
       return false;
     }
+    if (p.ppid > 0) {
+      try {
+        process.kill(p.ppid, 0);
+      } catch {
+        deletePeer.run(p.id);
+        return false;
+      }
+    }
+    return true;
   });
 }
 
