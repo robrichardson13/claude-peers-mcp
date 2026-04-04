@@ -61,32 +61,56 @@ db.run(`
 // Migration: add ppid column for orphan detection
 try {
   db.run("ALTER TABLE peers ADD COLUMN ppid INTEGER NOT NULL DEFAULT 0");
+  console.error("[claude-peers broker] Migration: added ppid column");
 } catch {
-  // Column already exists
+  // Column already exists — verify it's actually there
+  const cols = db.query("PRAGMA table_info(peers)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "ppid")) {
+    // Column genuinely missing and ALTER TABLE failed for a different reason — recreate table
+    console.error("[claude-peers broker] Migration: ppid column missing, recreating peers table");
+    db.run("DROP TABLE IF EXISTS peers");
+    db.run(`
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        ppid INTEGER NOT NULL DEFAULT 0,
+        cwd TEXT NOT NULL,
+        git_root TEXT,
+        tty TEXT,
+        summary TEXT NOT NULL DEFAULT '',
+        registered_at TEXT NOT NULL,
+        last_seen TEXT NOT NULL
+      )
+    `);
+  }
 }
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Clean up stale peers (PIDs that no longer exist) on startup and periodically
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid, ppid FROM peers").all() as { id: string; pid: number; ppid: number }[];
-  for (const peer of peers) {
-    let shouldRemove = false;
-    try {
-      process.kill(peer.pid, 0);
-    } catch {
-      shouldRemove = true;
-    }
-    // Check if parent is dead (orphaned MCP server)
-    if (!shouldRemove && peer.ppid > 0) {
+  try {
+    const peers = db.query("SELECT id, pid, ppid FROM peers").all() as { id: string; pid: number; ppid: number }[];
+    for (const peer of peers) {
+      let shouldRemove = false;
       try {
-        process.kill(peer.ppid, 0);
+        process.kill(peer.pid, 0);
       } catch {
         shouldRemove = true;
       }
+      // Check if parent is dead (orphaned MCP server)
+      if (!shouldRemove && peer.ppid > 0) {
+        try {
+          process.kill(peer.ppid, 0);
+        } catch {
+          shouldRemove = true;
+        }
+      }
+      if (shouldRemove) {
+        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      }
     }
-    if (shouldRemove) {
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-    }
+  } catch (e) {
+    console.error(`[claude-peers broker] cleanStalePeers error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -201,19 +225,17 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive and not orphaned
+  // Filter out peers whose process is no longer alive (cleanup handled by cleanStalePeers)
   return peers.filter((p) => {
     try {
       process.kill(p.pid, 0);
     } catch {
-      deletePeer.run(p.id);
       return false;
     }
     if (p.ppid > 0) {
       try {
         process.kill(p.ppid, 0);
       } catch {
-        deletePeer.run(p.id);
         return false;
       }
     }
