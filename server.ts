@@ -532,7 +532,8 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat (with orphan detection)
+  // 7. Start heartbeat (with orphan detection and re-registration)
+  let needsReregistration = false;
   const heartbeatTimer = setInterval(async () => {
     // Check if parent process died (reparented to init/launchd)
     const currentPpid = getLivePpid();
@@ -544,9 +545,29 @@ async function main() {
 
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+        if (needsReregistration) {
+          // Attempt re-registration with broker (it may have restarted)
+          await ensureBroker();
+          const reg = await brokerFetch<RegisterResponse>("/register", {
+            pid: process.pid,
+            ppid: originalPpid,
+            cwd: myCwd,
+            git_root: myGitRoot,
+            tty: getTty(),
+            summary: "",
+          });
+          myId = reg.id;
+          needsReregistration = false;
+          log(`Re-registered as peer ${myId}`);
+        } else {
+          await brokerFetch("/heartbeat", { id: myId });
+        }
+      } catch (e) {
+        if (!needsReregistration) {
+          log(`Heartbeat failed, will re-register on next tick: ${e instanceof Error ? e.message : String(e)}`);
+          needsReregistration = true;
+        }
+        // Already flagged for re-registration — back off until next interval
       }
     }
   }, HEARTBEAT_INTERVAL_MS);

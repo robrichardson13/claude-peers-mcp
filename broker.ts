@@ -85,25 +85,39 @@ try {
   }
 }
 
-// Clean up stale peers (PIDs that no longer exist) on startup and periodically
+// Stale peer thresholds
+const STALE_THRESHOLD_MS = 300_000;      // 5 minutes — remove if PID also dead
+const HARD_STALE_THRESHOLD_MS = 600_000; // 10 minutes — remove regardless of PID
+
+// Clean up stale peers on startup and periodically
 function cleanStalePeers() {
   try {
-    const peers = db.query("SELECT id, pid, ppid FROM peers").all() as { id: string; pid: number; ppid: number }[];
+    const peers = db.query("SELECT id, pid, ppid, last_seen FROM peers").all() as {
+      id: string; pid: number; ppid: number; last_seen: string;
+    }[];
+    const now = Date.now();
+
     for (const peer of peers) {
+      const age = now - new Date(peer.last_seen).getTime();
       let shouldRemove = false;
-      try {
-        process.kill(peer.pid, 0);
-      } catch {
+
+      if (age > HARD_STALE_THRESHOLD_MS) {
+        // Hard timeout — MCP server clearly stopped heartbeating
         shouldRemove = true;
-      }
-      // Check if parent is dead (orphaned MCP server)
-      if (!shouldRemove && peer.ppid > 0) {
-        try {
-          process.kill(peer.ppid, 0);
-        } catch {
+      } else if (age > STALE_THRESHOLD_MS) {
+        // Soft timeout — remove only if PID is also dead
+        if (!isProcessAlive(peer.pid)) {
+          shouldRemove = true;
+        }
+      } else {
+        // Recent entry — check PID and PPID liveness
+        if (!isProcessAlive(peer.pid)) {
+          shouldRemove = true;
+        } else if (peer.ppid > 0 && !isProcessAlive(peer.ppid)) {
           shouldRemove = true;
         }
       }
+
       if (shouldRemove) {
         db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
         db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
@@ -162,6 +176,24 @@ const selectUndelivered = db.prepare(`
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
+
+// --- Process liveness check ---
+
+/**
+ * Check if a process is alive. Handles EPERM (process exists but different user)
+ * correctly on macOS — EPERM means alive, ESRCH means dead.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false; // process doesn't exist
+    // EPERM = exists but different permissions, any other error = assume alive (safe default)
+    return true;
+  }
+}
 
 // --- Generate peer ID ---
 
@@ -227,18 +259,8 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   // Filter out peers whose process is no longer alive (cleanup handled by cleanStalePeers)
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-    } catch {
-      return false;
-    }
-    if (p.ppid > 0) {
-      try {
-        process.kill(p.ppid, 0);
-      } catch {
-        return false;
-      }
-    }
+    if (!isProcessAlive(p.pid)) return false;
+    if (p.ppid > 0 && !isProcessAlive(p.ppid)) return false;
     return true;
   });
 }
